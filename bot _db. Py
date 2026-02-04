@@ -1,0 +1,155 @@
+import sqlite3
+import json
+import time
+from typing import Dict, Any, Optional, List, Tuple
+
+DB_PATH = "bot.db"
+_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+_conn.row_factory = sqlite3.Row
+
+def init_db():
+    cur = _conn.cursor()
+
+    # per chat/user state
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        chat_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_seen REAL,
+        last_seen REAL,
+        interaction_count INTEGER,
+        state_json TEXT
+    )
+    """)
+
+    # global style profile
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS style_profile (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        profile_json TEXT NOT NULL
+    )
+    """)
+
+    # teaching pairs: key -> response
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS learned_pairs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        key TEXT NOT NULL,
+        response TEXT NOT NULL,
+        created_at REAL
+    )
+    """)
+
+    _conn.commit()
+
+DEFAULT_PROFILE = {
+    "emoji_level": 0.65,
+    "linebreak_level": 0.75,
+    "tease_level": 0.60,
+    "shy_level": 0.45,
+    "romantic_level": 0.60,
+    "energy_level": 0.70,
+
+    "fav_emojis": ["😂", "😏", "❤️", "🖤"],
+    "fav_reacts": ["Awwwn", "Okayyy", "Really", "Yay", "Lol", "Mhm", "Huh"],
+    "fav_endings": ["Go on", "Tell me", "And then😂", "Say more", "Wym😂"],
+}
+
+DEFAULT_STATE = {
+    "paused_global": False,   # stored only for admin status display (global pause is runtime)
+    "last_replies": [],
+    "mode": None,             # None = auto
+    "mood_locked": False,
+    "last_mode": None,
+    "flirt": True,
+    "relationship": "warm",   # new|warm|close
+    "teach_on": False,        # per-chat teaching toggle for admin
+}
+
+def _now() -> float:
+    return time.time()
+
+def get_profile() -> Dict[str, Any]:
+    cur = _conn.execute("SELECT profile_json FROM style_profile WHERE id=1")
+    row = cur.fetchone()
+    if not row:
+        _conn.execute("INSERT INTO style_profile (id, profile_json) VALUES (1, ?)",
+                      (json.dumps(DEFAULT_PROFILE),))
+        _conn.commit()
+        return dict(DEFAULT_PROFILE)
+    try:
+        return json.loads(row["profile_json"])
+    except Exception:
+        return dict(DEFAULT_PROFILE)
+
+def set_profile(profile: Dict[str, Any]):
+    _conn.execute("UPDATE style_profile SET profile_json=? WHERE id=1", (json.dumps(profile),))
+    _conn.commit()
+
+def ensure_user(chat_id: int, username: str):
+    cur = _conn.execute("SELECT chat_id FROM users WHERE chat_id=?", (chat_id,))
+    row = cur.fetchone()
+    if not row:
+        _conn.execute("""
+        INSERT INTO users (chat_id, username, first_seen, last_seen, interaction_count, state_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (chat_id, username or "", _now(), _now(), 0, json.dumps(DEFAULT_STATE)))
+        _conn.commit()
+
+def bump_user(chat_id: int, username: str):
+    ensure_user(chat_id, username)
+    _conn.execute("""
+    UPDATE users
+    SET last_seen=?, interaction_count=interaction_count+1,
+        username=COALESCE(NULLIF(?, ''), username)
+    WHERE chat_id=?
+    """, (_now(), username or "", chat_id))
+    _conn.commit()
+
+def get_state(chat_id: int) -> Dict[str, Any]:
+    cur = _conn.execute("SELECT state_json FROM users WHERE chat_id=?", (chat_id,))
+    row = cur.fetchone()
+    if not row or not row["state_json"]:
+        return dict(DEFAULT_STATE)
+    try:
+        st = json.loads(row["state_json"])
+        # ensure defaults exist
+        for k, v in DEFAULT_STATE.items():
+            st.setdefault(k, v)
+        return st
+    except Exception:
+        return dict(DEFAULT_STATE)
+
+def set_state(chat_id: int, state: Dict[str, Any]):
+    _conn.execute("UPDATE users SET state_json=? WHERE chat_id=?", (json.dumps(state), chat_id))
+    _conn.commit()
+
+def reset_user(chat_id: int):
+    _conn.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
+    _conn.commit()
+
+def add_pair(key: str, response: str):
+    key = (key or "").strip().lower()
+    response = (response or "").strip()
+    if not key or not response:
+        return
+    _conn.execute("INSERT INTO learned_pairs (key, response, created_at) VALUES (?,?,?)",
+                  (key, response, _now()))
+    _conn.commit()
+
+def find_pair(user_text: str, limit: int = 200) -> Optional[str]:
+    t = (user_text or "").lower()
+    cur = _conn.execute("SELECT key, response FROM learned_pairs ORDER BY id DESC LIMIT ?", (limit,))
+    for row in cur.fetchall():
+        k = row["key"]
+        if k and k in t:
+            return row["response"]
+    return None
+
+def clear_pairs():
+    _conn.execute("DELETE FROM learned_pairs")
+    _conn.commit()
+
+def count_pairs() -> int:
+    cur = _conn.execute("SELECT COUNT(*) AS c FROM learned_pairs")
+    return int(cur.fetchone()["c"])
