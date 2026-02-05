@@ -1,11 +1,13 @@
+# bot_db.py
 import sqlite3
 import json
 import time
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional
 
 DB_PATH = "bot.db"
 _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
+
 
 def init_db():
     cur = _conn.cursor()
@@ -42,6 +44,7 @@ def init_db():
 
     _conn.commit()
 
+
 DEFAULT_PROFILE = {
     "emoji_level": 0.65,
     "linebreak_level": 0.75,
@@ -49,42 +52,111 @@ DEFAULT_PROFILE = {
     "shy_level": 0.45,
     "romantic_level": 0.60,
     "energy_level": 0.70,
-
     "fav_emojis": ["😂", "😏", "❤️", "🖤"],
     "fav_reacts": ["Awwwn", "Okayyy", "Really", "Yay", "Lol", "Mhm", "Huh"],
     "fav_endings": ["Go on", "Tell me", "And then😂", "Say more", "Wym😂"],
 }
 
 DEFAULT_STATE = {
-    "paused_global": False,   # stored only for admin status display (global pause is runtime)
+    # stored only for admin status display (global pause is runtime)
+    "paused_global": False,
+
+    # reply memory
     "last_replies": [],
-    "mode": None,             # None = auto
+
+    # mode controls
+    "mode": None,            # None = auto
     "mood_locked": False,
     "last_mode": None,
+
+    # chat permissions
     "flirt": True,
-    "relationship": "warm",   # new|warm|close
-    "teach_on": False,        # per-chat teaching toggle for admin
+    "relationship": "warm",  # new|warm|close
+
+    # teaching
+    "teach_on": False,
+
+    # -------------------------
+    # NEW: emotional continuity
+    # -------------------------
+    "mood_vector": None,             # dict created by emotion_engine on first use
+    "negative_loop_score": 0,        # 0..10
+    "emotional_sensitivity": 50,     # 0..100
+    "disabled_emotions": [],         # e.g. ["jealousy"]
 }
+
 
 def _now() -> float:
     return time.time()
+
+
+def _migrate_state_defaults(st: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensures any missing keys are added for older DB rows.
+    Keeps backward compatibility forever.
+    """
+    if not isinstance(st, dict):
+        st = {}
+
+    for k, v in DEFAULT_STATE.items():
+        if k not in st:
+            # Important: copy mutable defaults safely
+            if isinstance(v, list):
+                st[k] = list(v)
+            elif isinstance(v, dict):
+                st[k] = dict(v)
+            else:
+                st[k] = v
+
+    # enforce sane types
+    if not isinstance(st.get("last_replies"), list):
+        st["last_replies"] = []
+    if st.get("relationship") not in {"new", "warm", "close"}:
+        st["relationship"] = "warm"
+    if st.get("mode") not in {None, "playful", "shy", "romantic", "soft", "serious"}:
+        st["mode"] = None
+    if not isinstance(st.get("disabled_emotions"), list):
+        st["disabled_emotions"] = []
+
+    # clamp sensitivity
+    try:
+        st["emotional_sensitivity"] = int(st.get("emotional_sensitivity", 50))
+    except Exception:
+        st["emotional_sensitivity"] = 50
+    st["emotional_sensitivity"] = max(0, min(100, st["emotional_sensitivity"]))
+
+    # clamp loop score
+    try:
+        st["negative_loop_score"] = int(st.get("negative_loop_score", 0))
+    except Exception:
+        st["negative_loop_score"] = 0
+    st["negative_loop_score"] = max(0, min(10, st["negative_loop_score"]))
+
+    return st
+
 
 def get_profile() -> Dict[str, Any]:
     cur = _conn.execute("SELECT profile_json FROM style_profile WHERE id=1")
     row = cur.fetchone()
     if not row:
-        _conn.execute("INSERT INTO style_profile (id, profile_json) VALUES (1, ?)",
-                      (json.dumps(DEFAULT_PROFILE),))
+        _conn.execute(
+            "INSERT INTO style_profile (id, profile_json) VALUES (1, ?)",
+            (json.dumps(DEFAULT_PROFILE),),
+        )
         _conn.commit()
         return dict(DEFAULT_PROFILE)
+
     try:
-        return json.loads(row["profile_json"])
+        p = json.loads(row["profile_json"])
+        return p if isinstance(p, dict) else dict(DEFAULT_PROFILE)
     except Exception:
         return dict(DEFAULT_PROFILE)
+
 
 def set_profile(profile: Dict[str, Any]):
     _conn.execute("UPDATE style_profile SET profile_json=? WHERE id=1", (json.dumps(profile),))
     _conn.commit()
+
 
 def ensure_user(chat_id: int, username: str):
     cur = _conn.execute("SELECT chat_id FROM users WHERE chat_id=?", (chat_id,))
@@ -96,6 +168,7 @@ def ensure_user(chat_id: int, username: str):
         """, (chat_id, username or "", _now(), _now(), 0, json.dumps(DEFAULT_STATE)))
         _conn.commit()
 
+
 def bump_user(chat_id: int, username: str):
     ensure_user(chat_id, username)
     _conn.execute("""
@@ -106,49 +179,61 @@ def bump_user(chat_id: int, username: str):
     """, (_now(), username or "", chat_id))
     _conn.commit()
 
+
 def get_state(chat_id: int) -> Dict[str, Any]:
     cur = _conn.execute("SELECT state_json FROM users WHERE chat_id=?", (chat_id,))
     row = cur.fetchone()
     if not row or not row["state_json"]:
-        return dict(DEFAULT_STATE)
+        return _migrate_state_defaults(dict(DEFAULT_STATE))
+
     try:
         st = json.loads(row["state_json"])
-        # ensure defaults exist
-        for k, v in DEFAULT_STATE.items():
-            st.setdefault(k, v)
+        st = _migrate_state_defaults(st)
         return st
     except Exception:
-        return dict(DEFAULT_STATE)
+        return _migrate_state_defaults(dict(DEFAULT_STATE))
+
 
 def set_state(chat_id: int, state: Dict[str, Any]):
+    state = _migrate_state_defaults(state)
     _conn.execute("UPDATE users SET state_json=? WHERE chat_id=?", (json.dumps(state), chat_id))
     _conn.commit()
+
 
 def reset_user(chat_id: int):
     _conn.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
     _conn.commit()
+
 
 def add_pair(key: str, response: str):
     key = (key or "").strip().lower()
     response = (response or "").strip()
     if not key or not response:
         return
-    _conn.execute("INSERT INTO learned_pairs (key, response, created_at) VALUES (?,?,?)",
-                  (key, response, _now()))
+    _conn.execute(
+        "INSERT INTO learned_pairs (key, response, created_at) VALUES (?,?,?)",
+        (key, response, _now()),
+    )
     _conn.commit()
+
 
 def find_pair(user_text: str, limit: int = 200) -> Optional[str]:
     t = (user_text or "").lower()
-    cur = _conn.execute("SELECT key, response FROM learned_pairs ORDER BY id DESC LIMIT ?", (limit,))
+    cur = _conn.execute(
+        "SELECT key, response FROM learned_pairs ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
     for row in cur.fetchall():
         k = row["key"]
         if k and k in t:
             return row["response"]
     return None
 
+
 def clear_pairs():
     _conn.execute("DELETE FROM learned_pairs")
     _conn.commit()
+
 
 def count_pairs() -> int:
     cur = _conn.execute("SELECT COUNT(*) AS c FROM learned_pairs")
