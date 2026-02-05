@@ -1,8 +1,9 @@
+# main.py
 import re
 import time
 import random
 from collections import defaultdict, deque
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -22,6 +23,11 @@ from bot_db import (
 from delay_engine import human_delay
 from style_engine import apply_style
 
+# NEW engines (you will create these files)
+from emotion_engine import infer_emotion, update_mood_vector
+from relationship_engine import apply_relationship_limits
+from safety_engine import evaluate_safety
+
 # -------------------------
 # Global runtime switches
 # -------------------------
@@ -31,7 +37,7 @@ PAUSED_GLOBAL = False
 _last_ts = defaultdict(float)
 _burst = defaultdict(lambda: deque(maxlen=8))
 
-# Vibe dictionaries
+# Vibe dictionaries (kept for your current template generator)
 SAD_WORDS = {"sad", "tired", "lonely", "depressed", "cry", "hurt", "stress", "stressed", "down", "broken"}
 SWEET_WORDS = {"miss", "missed", "love", "baby", "babe", "sweet", "honey", "darling", "cute"}
 ANGRY_WORDS = {"angry", "mad", "annoyed", "pissed", "hate"}
@@ -39,20 +45,25 @@ ANGRY_WORDS = {"angry", "mad", "annoyed", "pissed", "hate"}
 # Keep “naughty” suggestive, not explicit
 EXPLICIT_WORDS = {"fuck", "pussy", "dick", "blowjob", "cum", "nude", "naked", "sex"}
 
+
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
 
+
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
+
 
 def _keywords(text: str) -> List[str]:
     t = re.sub(r"[^a-zA-Z0-9\s']", " ", text or "").lower()
     words = [w for w in t.split() if len(w) >= 3]
     return words[:6]
 
+
 def _make_key_phrase(user_line: str) -> str:
     words = _keywords(user_line)
     return " ".join(words[:5]).strip()
+
 
 def detect_vibe(text: str) -> Dict[str, Any]:
     raw = (text or "").strip()
@@ -77,18 +88,22 @@ def detect_vibe(text: str) -> Dict[str, Any]:
 
     return {"vibe": vibe, "energy": energy}
 
+
 def pick_not_repeat(options: List[str], last: List[str]) -> str:
     last_set = set(last[-10:])
     pool = [o for o in options if o not in last_set]
     return random.choice(pool) if pool else random.choice(options)
+
 
 def maybe_emoji(profile: Dict[str, Any], intensity: float = 1.0) -> str:
     if random.random() < profile.get("emoji_level", 0.65) * intensity:
         return random.choice(profile.get("fav_emojis", ["😂"]))
     return ""
 
+
 def lb(profile: Dict[str, Any]) -> str:
     return "\n\n" if random.random() < profile.get("linebreak_level", 0.75) else " "
+
 
 def energy_pack(profile: Dict[str, Any], mode: str, relationship: str, flirt: bool) -> Dict[str, List[str]]:
     # relationship stages change warmth + closeness
@@ -108,32 +123,46 @@ def energy_pack(profile: Dict[str, Any], mode: str, relationship: str, flirt: bo
         endings = ["Explain it", "Tell me properly", "What happened", "Be real with me"]
 
     if not flirt:
-        # reduce teasing
-        endings = [e.replace("baby", "").strip() for e in endings]
+        endings = [e.replace("baby", "").replace("Baby", "").strip() for e in endings]
         endings = [e for e in endings if e]
 
     return {"reacts": reacts, "endings": endings}
+
+
+def _has_explicit(text: str) -> bool:
+    raw = (text or "").lower()
+    for w in EXPLICIT_WORDS:
+        if re.search(rf"\b{re.escape(w)}\b", raw):
+            return True
+    return False
+
 
 def generate_reply(user_text: str, state: Dict[str, Any], profile: Dict[str, Any]) -> str:
     raw = (user_text or "").strip()
     t = raw.lower()
     last = state.get("last_replies", [])
 
-    # explicit handling (keep it “naughty” but not graphic)
-    if any(w in t.split() for w in EXPLICIT_WORDS):
+    # Explicit handling (keep it “naughty” but not graphic)
+    if _has_explicit(t):
         if state.get("flirt", True) and state.get("relationship") in ("warm", "close"):
-            return pick_not_repeat([
-                f"Stoppp😂{lb(profile)}You’re wild😏",
-                f"Hehe😏{lb(profile)}Keep it cute😂",
-                f"Okayyy😏{lb(profile)}Not too much now😂",
-            ], last)
-        return pick_not_repeat([
-            f"Lol😂{lb(profile)}Let’s chill",
-            f"Hmm{lb(profile)}Nope",
-            f"Okayyy😂{lb(profile)}Not that",
-        ], last)
+            return pick_not_repeat(
+                [
+                    f"Stoppp😂{lb(profile)}You’re wild😏",
+                    f"Hehe😏{lb(profile)}Keep it cute😂",
+                    f"Okayyy😏{lb(profile)}Not too much now😂",
+                ],
+                last,
+            )
+        return pick_not_repeat(
+            [
+                f"Lol😂{lb(profile)}Let’s chill",
+                f"Hmm{lb(profile)}Nope",
+                f"Okayyy😂{lb(profile)}Not that",
+            ],
+            last,
+        )
 
-    # learned pair match
+    # Learned pair match
     learned = find_pair(raw)
     if learned:
         if random.random() < 0.35:
@@ -141,7 +170,7 @@ def generate_reply(user_text: str, state: Dict[str, Any], profile: Dict[str, Any
             learned = f"{react}{maybe_emoji(profile, 0.9)}{lb(profile)}{learned}"
         return learned
 
-    # vibe detection + lock
+    # Vibe detection + lock
     dv = detect_vibe(raw)
     user_vibe = dv["vibe"]
 
@@ -153,7 +182,8 @@ def generate_reply(user_text: str, state: Dict[str, Any], profile: Dict[str, Any
         if mood_locked:
             mode = state.get("last_mode") or user_vibe
         else:
-            mode = user_vibe
+            # if emotion_engine hinted a mode, prefer it
+            mode = state.get("last_mode") or user_vibe
             state["last_mode"] = mode
 
     flirt = bool(state.get("flirt", True))
@@ -163,106 +193,138 @@ def generate_reply(user_text: str, state: Dict[str, Any], profile: Dict[str, Any
     reacts = pack["reacts"]
     endings = pack["endings"]
 
-    # greetings
+    # Greetings
     if re.search(r"\b(hi|hey|hello|hii|heyy|yo)\b", t):
-        return pick_not_repeat([
-            "Heyy" + maybe_emoji(profile, 1.0),
-            "Hii" + maybe_emoji(profile, 1.0),
-            "Hi hi" + maybe_emoji(profile, 1.0),
-        ], last)
+        return pick_not_repeat(
+            [
+                "Heyy" + maybe_emoji(profile, 1.0),
+                "Hii" + maybe_emoji(profile, 1.0),
+                "Hi hi" + maybe_emoji(profile, 1.0),
+            ],
+            last,
+        )
 
-    # how are you
+    # How are you
     if "how are you" in t or "how r you" in t or "how you" in t:
-        return pick_not_repeat([
-            f"Good{maybe_emoji(profile,1.0)}{lb(profile)}You",
-            f"Chilling{maybe_emoji(profile,1.0)}{lb(profile)}Wbu",
-            f"I’m okay{lb(profile)}You good{maybe_emoji(profile,0.9)}",
-        ], last)
+        return pick_not_repeat(
+            [
+                f"Good{maybe_emoji(profile,1.0)}{lb(profile)}You",
+                f"Chilling{maybe_emoji(profile,1.0)}{lb(profile)}Wbu",
+                f"I’m okay{lb(profile)}You good{maybe_emoji(profile,0.9)}",
+            ],
+            last,
+        )
 
-    # missed you
+    # Missed you
     if "miss you" in t or "missed you" in t:
         if relationship == "new":
-            return pick_not_repeat([
-                f"Aww{maybe_emoji(profile,1.0)}{lb(profile)}That’s sweet",
-                f"Hehe{maybe_emoji(profile,1.0)}{lb(profile)}Tell me more",
-            ], last)
-        return pick_not_repeat([
-            f"Awwwn{maybe_emoji(profile,1.0)}{lb(profile)}I missed you too{lb(profile)}Where you been{maybe_emoji(profile,0.8)}",
-            f"Hehe{maybe_emoji(profile,1.0)}{lb(profile)}Come here{lb(profile)}Tell me what’s up",
-            f"Yay{maybe_emoji(profile,1.0)}{lb(profile)}I like that{lb(profile)}So how was your day{maybe_emoji(profile,0.7)}",
-        ], last)
+            return pick_not_repeat(
+                [
+                    f"Aww{maybe_emoji(profile,1.0)}{lb(profile)}That’s sweet",
+                    f"Hehe{maybe_emoji(profile,1.0)}{lb(profile)}Tell me more",
+                ],
+                last,
+            )
+        return pick_not_repeat(
+            [
+                f"Awwwn{maybe_emoji(profile,1.0)}{lb(profile)}I missed you too{lb(profile)}Where you been{maybe_emoji(profile,0.8)}",
+                f"Hehe{maybe_emoji(profile,1.0)}{lb(profile)}Come here{lb(profile)}Tell me what’s up",
+                f"Yay{maybe_emoji(profile,1.0)}{lb(profile)}I like that{lb(profile)}So how was your day{maybe_emoji(profile,0.7)}",
+            ],
+            last,
+        )
 
     # “can I tell you…”
     if "can i tell you" in t or "let me tell you" in t or "i want to tell you" in t:
-        return pick_not_repeat([
-            f"Yes pls{maybe_emoji(profile,1.0)}{lb(profile)}Tell me everything",
-            f"Go onnn{maybe_emoji(profile,1.0)}{lb(profile)}I’m listening",
-            f"Say it{lb(profile)}I’m here{maybe_emoji(profile,0.9)}",
-        ], last)
+        return pick_not_repeat(
+            [
+                f"Yes pls{maybe_emoji(profile,1.0)}{lb(profile)}Tell me everything",
+                f"Go onnn{maybe_emoji(profile,1.0)}{lb(profile)}I’m listening",
+                f"Say it{lb(profile)}I’m here{maybe_emoji(profile,0.9)}",
+            ],
+            last,
+        )
 
-    # questions
+    # Questions
     if "?" in raw:
         react = pick_not_repeat([r + maybe_emoji(profile, 0.9) for r in reacts], last)
         end = random.choice(endings) + maybe_emoji(profile, 0.8)
 
         if mode == "shy":
-            end = pick_not_repeat([
-                f"Umm{maybe_emoji(profile,1.0)}",
-                f"Tell me pls{maybe_emoji(profile,1.0)}",
-                f"Wym{maybe_emoji(profile,1.0)}",
-            ], last)
+            end = pick_not_repeat(
+                [
+                    f"Umm{maybe_emoji(profile,1.0)}",
+                    f"Tell me pls{maybe_emoji(profile,1.0)}",
+                    f"Wym{maybe_emoji(profile,1.0)}",
+                ],
+                last,
+            )
         if mode == "romantic" and flirt and relationship in ("warm", "close"):
-            end = pick_not_repeat([
-                f"Tell me baby{maybe_emoji(profile,0.9)}",
-                f"Talk to me{maybe_emoji(profile,0.8)}",
-                f"Come here{maybe_emoji(profile,0.8)}",
-            ], last)
+            end = pick_not_repeat(
+                [
+                    f"Tell me baby{maybe_emoji(profile,0.9)}",
+                    f"Talk to me{maybe_emoji(profile,0.8)}",
+                    f"Come here{maybe_emoji(profile,0.8)}",
+                ],
+                last,
+            )
 
         return f"{react}{lb(profile)}{end}"
 
-    # very short texts
+    # Very short texts
     if len(t) <= 7:
-        base = pick_not_repeat([
-            f"Yep{maybe_emoji(profile,0.9)}",
-            f"Really{maybe_emoji(profile,1.0)}",
-            f"Okayyy{maybe_emoji(profile,1.0)}",
-            f"Huh{maybe_emoji(profile,1.0)}",
-            f"Lol{maybe_emoji(profile,1.0)}",
-        ], last)
+        base = pick_not_repeat(
+            [
+                f"Yep{maybe_emoji(profile,0.9)}",
+                f"Really{maybe_emoji(profile,1.0)}",
+                f"Okayyy{maybe_emoji(profile,1.0)}",
+                f"Huh{maybe_emoji(profile,1.0)}",
+                f"Lol{maybe_emoji(profile,1.0)}",
+            ],
+            last,
+        )
 
         if random.random() < 0.6:
             nudge = random.choice(endings) + maybe_emoji(profile, 0.7)
             return f"{base}{lb(profile)}{nudge}"
         return base
 
-    # default: reaction + pull (alive)
+    # Default: reaction + pull (alive)
     react_word = pick_not_repeat(reacts, last)
     react = react_word + maybe_emoji(profile, 0.9)
 
-    playful_pulls = [
+    pulls = [
         f"And then{maybe_emoji(profile,0.9)}",
         f"So what happened next{maybe_emoji(profile,0.8)}",
         f"Tell me the full thing{maybe_emoji(profile,0.8)}",
         f"Go onnn{maybe_emoji(profile,1.0)}",
     ]
     if mode == "soft":
-        playful_pulls = ["Talk to me", "I’m listening", "Come here", "What happened"]
+        pulls = ["Talk to me", "I’m listening", "Come here", "What happened"]
     elif mode == "serious":
-        playful_pulls = ["Explain it", "Tell me properly", "What’s the real issue", "Okay\n\nGo on"]
+        pulls = ["Explain it", "Tell me properly", "What’s the real issue", "Okay\n\nGo on"]
     elif mode == "shy":
-        playful_pulls = [f"Hehe{maybe_emoji(profile,1.0)}{lb(profile)}Go on", f"Okayyy{maybe_emoji(profile,1.0)}{lb(profile)}Tell me"]
+        pulls = [f"Hehe{maybe_emoji(profile,1.0)}{lb(profile)}Go on", f"Okayyy{maybe_emoji(profile,1.0)}{lb(profile)}Tell me"]
     elif mode == "romantic":
-        playful_pulls = [f"Awwwn{maybe_emoji(profile,1.0)}{lb(profile)}Talk to me", f"Come here{maybe_emoji(profile,0.8)}{lb(profile)}Tell me"]
+        pulls = [f"Awwwn{maybe_emoji(profile,1.0)}{lb(profile)}Talk to me", f"Come here{maybe_emoji(profile,0.8)}{lb(profile)}Tell me"]
 
-    pull = pick_not_repeat(playful_pulls, last)
+    pull = pick_not_repeat(pulls, last)
 
-    # extra spice (only if flirt + warm/close)
-    if state.get("flirt", True) and relationship in ("warm", "close") and mode in ("playful", "romantic") and random.random() < profile.get("tease_level", 0.6):
-        pull = pick_not_repeat([
-            f"Okayyy😏{lb(profile)}You’re trouble😂",
-            f"Stoppp😂{lb(profile)}Come closer😏",
-            f"Hehe😏{lb(profile)}What you want from me😂",
-        ], last)
+    # Extra spice (only if flirt + warm/close)
+    if (
+        state.get("flirt", True)
+        and relationship in ("warm", "close")
+        and mode in ("playful", "romantic")
+        and random.random() < profile.get("tease_level", 0.6)
+    ):
+        pull = pick_not_repeat(
+            [
+                f"Okayyy😏{lb(profile)}You’re trouble😂",
+                f"Stoppp😂{lb(profile)}Come closer😏",
+                f"Hehe😏{lb(profile)}What you want from me😂",
+            ],
+            last,
+        )
 
     return f"{react}{lb(profile)}{pull}"
 
@@ -279,6 +341,7 @@ TRAIN_HELP = (
     "ME: awwwn😂 come here\n\n"
     "I learn U -> ME pairs.\n"
 )
+
 
 def parse_training_block(block: str) -> List[tuple]:
     lines = [ln.strip() for ln in (block or "").splitlines() if ln.strip()]
@@ -318,8 +381,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(chat_id, username)
     bump_user(chat_id, username)
 
-    state = get_state(chat_id)
+    state = get_state(chat_id) or {}
     profile = get_profile()
+
+    # Ensure state defaults (keeps continuity stable)
+    state.setdefault("relationship", "warm")
+    state.setdefault("mode", None)  # None = auto
+    state.setdefault("flirt", True)
+    state.setdefault("mood_locked", False)
+    state.setdefault("last_mode", None)
+    state.setdefault("mood_vector", None)
+    state.setdefault("negative_loop_score", 0)
+    state.setdefault("emotional_sensitivity", 50)
+    state.setdefault("disabled_emotions", [])
+    state.setdefault("teach_on", False)
 
     # Teaching mode (admin only)
     if is_admin(update) and state.get("teach_on", False):
@@ -337,17 +412,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if PAUSED_GLOBAL:
         return
 
-    # Generate reply
+    # -------------------------
+    # Emotion/Relationship/Safety pipeline
+    # -------------------------
+    signal = infer_emotion(text, state)  # intent/tension/energy/mode_hint/delta
+    _limits = apply_relationship_limits(state)  # currently unused in templates, but ready
+    safety = evaluate_safety(text, state, signal)  # sets loop score + pace + no_teasing, etc.
+    state = update_mood_vector(state, signal, safety)
+
+    # If AUTO mode and not locked: let emotion engine hint drive last_mode
+    if not state.get("mode") and not state.get("mood_locked", False):
+        mh = signal.get("mode_hint")
+        if mh in {"playful", "shy", "romantic", "soft", "serious", "curious"}:
+            # map curious -> playful (you can later add a true curious mode)
+            state["last_mode"] = "playful" if mh == "curious" else mh
+
+    # Generate reply (still your current generator)
     reply = generate_reply(text, state, profile)
+
+    # Safety post-filter (lightweight guard for now)
+    if safety.get("force_concise"):
+        reply = reply[:160].rstrip()
+    if safety.get("no_teasing"):
+        reply = reply.replace("😏", "")
+        reply = re.sub(r"\bbaby\b", "", reply, flags=re.IGNORECASE).strip()
+
     reply = apply_style(reply, profile.get("linebreak_level", 0.75))
 
-    # Save last replies
+    # Save last replies + state
     state["last_replies"] = (state.get("last_replies", []) + [reply])[-10:]
     set_state(chat_id, state)
 
-    # Typing + delay
+    # Typing + delay (emotion-aware pace)
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    await human_delay(text, reply)
+    await human_delay(text, reply, pace=safety.get("pace", "normal"))
 
     await update.message.reply_text(reply)
 
@@ -358,7 +456,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def require_admin(update: Update, cmd_name: str) -> bool:
     if is_admin(update):
         return True
-    # Always reply so user knows it’s working (and controlled)
     await update.message.reply_text("Not allowed 😏")
     return False
 
@@ -371,12 +468,14 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("Working ✅")
 
+
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PAUSED_GLOBAL
     if not await require_admin(update, "pause"):
         return
     PAUSED_GLOBAL = True
     await update.message.reply_text("Paused ✅")
+
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PAUSED_GLOBAL
@@ -385,29 +484,32 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PAUSED_GLOBAL = False
     await update.message.reply_text("Resumed ✅")
 
+
 async def cmd_teach_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "teach_on"):
         return
     chat_id = update.effective_chat.id
-    st = get_state(chat_id)
+    st = get_state(chat_id) or {}
     st["teach_on"] = True
     set_state(chat_id, st)
     await update.message.reply_text("Teaching ON ✅\n\n" + TRAIN_HELP)
+
 
 async def cmd_teach_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "teach_off"):
         return
     chat_id = update.effective_chat.id
-    st = get_state(chat_id)
+    st = get_state(chat_id) or {}
     st["teach_on"] = False
     set_state(chat_id, st)
     await update.message.reply_text("Teaching OFF ✅")
+
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "mode"):
         return
     chat_id = update.effective_chat.id
-    st = get_state(chat_id)
+    st = get_state(chat_id) or {}
 
     if not context.args:
         await update.message.reply_text("Use: /mode playful|shy|romantic|soft|serious|auto ✅")
@@ -428,29 +530,32 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_state(chat_id, st)
     await update.message.reply_text(f"Mode: {m.upper()} ✅")
 
+
 async def cmd_flirt_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "flirt_on"):
         return
     chat_id = update.effective_chat.id
-    st = get_state(chat_id)
+    st = get_state(chat_id) or {}
     st["flirt"] = True
     set_state(chat_id, st)
     await update.message.reply_text("Flirt: ON ✅")
+
 
 async def cmd_flirt_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "flirt_off"):
         return
     chat_id = update.effective_chat.id
-    st = get_state(chat_id)
+    st = get_state(chat_id) or {}
     st["flirt"] = False
     set_state(chat_id, st)
     await update.message.reply_text("Flirt: OFF ✅")
+
 
 async def cmd_relationship(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "relationship"):
         return
     chat_id = update.effective_chat.id
-    st = get_state(chat_id)
+    st = get_state(chat_id) or {}
 
     if not context.args:
         await update.message.reply_text("Use: /relationship new|warm|close|reset ✅")
@@ -471,23 +576,26 @@ async def cmd_relationship(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_state(chat_id, st)
     await update.message.reply_text(f"Relationship: {v.upper()} ✅")
 
+
 async def cmd_lock_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "lock_mood"):
         return
     chat_id = update.effective_chat.id
-    st = get_state(chat_id)
+    st = get_state(chat_id) or {}
     st["mood_locked"] = True
     set_state(chat_id, st)
     await update.message.reply_text("Mood lock: ON ✅")
+
 
 async def cmd_unlock_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "unlock_mood"):
         return
     chat_id = update.effective_chat.id
-    st = get_state(chat_id)
+    st = get_state(chat_id) or {}
     st["mood_locked"] = False
     set_state(chat_id, st)
     await update.message.reply_text("Mood lock: OFF ✅")
+
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "profile"):
@@ -503,11 +611,12 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"pairs={count_pairs()}"
     )
 
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "status"):
         return
     chat_id = update.effective_chat.id
-    st = get_state(chat_id)
+    st = get_state(chat_id) or {}
     await update.message.reply_text(
         "Status ✅\n"
         f"paused_global={PAUSED_GLOBAL}\n"
@@ -516,16 +625,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"relationship={st.get('relationship','warm')}\n"
         f"mood_locked={'yes' if st.get('mood_locked', False) else 'no'}\n"
         f"teach_on={'yes' if st.get('teach_on', False) else 'no'}\n"
-        f"pairs={count_pairs()}"
+        f"pairs={count_pairs()}\n"
+        f"loop_score={st.get('negative_loop_score',0)}\n"
+        f"sensitivity={st.get('emotional_sensitivity',50)}"
     )
+
 
 async def cmd_reset_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "reset_chat"):
         return
     chat_id = update.effective_chat.id
-    reset_user(chat_id)      # deletes user row
+    reset_user(chat_id)  # deletes user row
     ensure_user(chat_id, update.effective_user.username or "")
     await update.message.reply_text("Chat memory reset ✅")
+
 
 async def cmd_clear_pairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "clear_pairs"):
@@ -533,11 +646,13 @@ async def cmd_clear_pairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_pairs()
     await update.message.reply_text("All taught pairs cleared ✅")
 
+
 async def cmd_reset_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "reset_style"):
         return
     set_profile(dict(DEFAULT_PROFILE))
     await update.message.reply_text("Style profile reset ✅")
+
 
 async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, "help_admin"):
@@ -558,8 +673,8 @@ async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\n" + TRAIN_HELP
     )
 
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Always reply so you *see* it works
     if is_admin(update):
         await update.message.reply_text("Command not found 😅\nTry /help_admin")
     else:
